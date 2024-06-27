@@ -85,6 +85,7 @@ if [ $((${MODE} & 0x02)) -ne 0 ]; then
         echo "Please check if `pwd` is a valid Intel® Extension for PyTorch* source code directory."
         exit 3
     fi
+    source ~/miniconda3/bin/activate compile_py310
     python -m pip install pyyaml
     VER_DS=$(python scripts/tools/compilation_helper/yaml_utils.py -f dependency_version.yml -d deepspeed -k version)
     VER_IDEX=$(python scripts/tools/compilation_helper/yaml_utils.py -f dependency_version.yml -d intel-extension-for-deepspeed -k version)

@@ -25,6 +25,7 @@ from transformers import (
     LlamaTokenizer,
 )
 
+os.environ["CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK"] = "0"
 
 # supported models now
 MODEL_CLASSES = {
@@ -167,10 +168,12 @@ def get_repo_root(model_name_or_path):
 
 def get_checkpoint_files(model_name_or_path):
     cached_repo_dir = get_repo_root(model_name_or_path)
+    # print(">>>>>>>>>>>> cached_repo_dir=", cached_repo_dir)
 
     # extensions: .bin | .pt
     # creates a list of paths from all downloaded files in cache dir
-    file_list = [str(entry) for entry in Path(cached_repo_dir).rglob("*.[bp][it][n]") if entry.is_file()]
+    file_list = [str(entry) for entry in Path(cached_repo_dir).rglob("*.safetensors") if entry.is_file()]
+    # print(">>>>>>>>>>>> file_list=", file_list)
     return file_list
 
 

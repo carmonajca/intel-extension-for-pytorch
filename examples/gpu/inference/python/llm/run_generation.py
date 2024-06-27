@@ -15,6 +15,7 @@ from transformers import (
     LlamaForCausalLM,
     AutoTokenizer,
     LlamaTokenizer,
+    PreTrainedTokenizerFast,
 )
 
 
@@ -22,7 +23,7 @@ from transformers import (
 MODEL_CLASSES = {
     "gpt-j": (AutoModelForCausalLM, AutoTokenizer),
     "gpt-neox": (AutoModelForCausalLM, AutoTokenizer),
-    "llama": (AutoModelForCausalLM, LlamaTokenizer),
+    "llama": (AutoModelForCausalLM, PreTrainedTokenizerFast),  # LlamaTokenizer),
     "opt": (AutoModelForCausalLM, AutoTokenizer),
     "falcon": (AutoModelForCausalLM, AutoTokenizer),
     "bloom": (AutoModelForCausalLM, AutoTokenizer),

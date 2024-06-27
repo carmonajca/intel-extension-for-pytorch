@@ -42,10 +42,17 @@ FROM base AS dev
 ARG COMPILE
 RUN bash /basekit_driver_install_helper.sh dev
 COPY --chown=ubuntu:ubuntu . ./intel-extension-for-pytorch/
-RUN . ./miniconda3/bin/activate && \
-    conda create -y -n compile_py310 python=3.10 && conda activate compile_py310 && \
-    cd intel-extension-for-pytorch/examples/gpu/inference/python/llm && \
+RUN . ~/miniconda3/bin/activate && \
+    conda create -y -n compile_py310 python=3.10 && \
+    source ~/miniconda3/bin/activate compile_py310 && \
+    conda run -n compile_py310 python -m pip install --upgrade pip
+RUN cd intel-extension-for-pytorch/examples/gpu/inference/python/llm && \
     if [ -z ${COMPILE} ]; then MODE=6; else MODE=2; fi && \
+    echo "MODE=${MODE}"  && \
+    export "COMPILER_PATH=/opt/intel/oneapi/compiler/latest" && \
+    export "MKL_PATH=/opt/intel/oneapi/mkl/latest" && \
+    export "CCL_PATH=/opt/intel/oneapi/ccl/latest" && \
+    export "MPI_PATH=/opt/intel/oneapi/mpi/latest" && \
     bash tools/env_setup.sh ${MODE} /opt/intel/oneapi/compiler/latest /opt/intel/oneapi/mkl/latest /opt/intel/oneapi/ccl/latest /opt/intel/oneapi/mpi/latest pvc,ats-m150,acm-g11
 
 FROM base AS deploy

@@ -201,3 +201,7 @@ csrc/aten/generated/*
 # pytorch ported UT log files
 tests/gpu/pytorch/*-reports
 genxir
+
+
+**/*_release/
+**/wheels/*.whl

@@ -54,7 +54,7 @@ constexpr bool is_sym_quant(const int qw_type) {
 #if defined(CPU_CAPABILITY_AVX512_FP16) && defined(COMPILER_PREREQ_MET)
 
 #define QUANT_A_THRESHOLD 30720
-#define SMALL_BATCH_THRESHOLD 32
+static int SMALL_BATCH_THRESHOLD = env2int("IPEX_WOQ_SMALL_BATCH_THRESHOLD", 5);
 #define DEQUANT_UPFRONT_THRESHOLD 1024
 #define PARALLEL_M_THRESHOLD 128
 constexpr long PREFETCH_K_DIST = 64; // TODO(jgong5): do not hard-code
@@ -72,6 +72,10 @@ constexpr long LOOP_K_UNROLL = 4; // TODO(jgong5): do not hard-code
 
 #define QUANT_W_PER_CHANNEL 0
 #define QUANT_W_PER_K_BLOCK 1
+
+constexpr bool is_asymmetric_quant_a(const int quant_a_mode) {
+  return quant_a_mode <= QUANT_A_PER_M_K_BLOCK;
+}
 
 // negate elements in a according to b's sign
 static inline __m512i _mm512_sign_epi8(__m512i a, __m512i b) {
@@ -749,7 +753,7 @@ struct GemmMicroKernel<
       vscales[i] = _mm512_loadu_ps(scales + i * 16);
       // TODO(jgong5): should we use 512 or two 256 here?
       vzps[i] = combine_m256i(load_zps_4vnni(zps + i * 16));
-      if (zp_a) {
+      if constexpr (is_asymmetric_quant_a(quant_a_mode)) {
         vcompensate[i] = _mm512_setzero_epi32();
       }
     });
@@ -772,7 +776,7 @@ struct GemmMicroKernel<
       if constexpr (row == 0) {
         vb[col] = combine_m256i(load_int4_as_int8(pqB[k / 4][col * 16]));
         vb[col] = _mm512_sub_epi8(vb[col], vzps[col]);
-        if (zp_a) {
+        if constexpr (is_asymmetric_quant_a(quant_a_mode)) {
           vcompensate[col] =
               _mm512_dpbusd_epi32(vcompensate[col], ones, vb[col]);
         }
@@ -780,7 +784,7 @@ struct GemmMicroKernel<
           _mm_prefetch(pqB[(k + PREFETCH_K_DIST) / 4][col * 16], _MM_HINT_T0);
         }
       }
-      if (zp_a) {
+      if constexpr (is_asymmetric_quant_a(quant_a_mode)) {
         vc[i] = _mm512_dpbusd_epi32(vc[i], va, vb[col]);
       } else {
         auto vsb = _mm512_sign_epi8(vb[col], va);
@@ -814,7 +818,9 @@ struct GemmMicroKernel<
           quant_a_mode == QUANT_A_PER_K_BLOCK ||
           quant_a_mode == QUANT_A_PER_TENSOR_SYM ||
           quant_a_mode == QUANT_A_PER_K_BLOCK_SYM) {
-        if (zp_a) {
+        if constexpr (
+            quant_a_mode == QUANT_A_PER_TENSOR ||
+            quant_a_mode == QUANT_A_PER_K_BLOCK) {
           vc[i] = _mm512_sub_epi32(
               vc[i],
               _mm512_mullo_epi32(vcompensate[col], _mm512_set1_epi32(*zp_a)));
@@ -823,7 +829,7 @@ struct GemmMicroKernel<
         vc_float = _mm512_mul_ps(vc_float, _mm512_set1_ps(*scale_a));
       } else if constexpr (
           quant_a_mode == QUANT_A_PER_M || quant_a_mode == QUANT_A_PER_M_SYM) {
-        if (zp_a) {
+        if constexpr (quant_a_mode == QUANT_A_PER_M) {
           vc[i] = _mm512_sub_epi32(
               vc[i],
               _mm512_mullo_epi32(
@@ -832,7 +838,7 @@ struct GemmMicroKernel<
         vc_float = _mm512_cvtepi32_ps(vc[i]);
         vc_float = _mm512_mul_ps(vc_float, _mm512_set1_ps(*(scale_a + row)));
       } else {
-        if (zp_a) {
+        if constexpr (is_asymmetric_quant_a(quant_a_mode)) {
           vc[i] = _mm512_sub_epi32(
               vc[i],
               _mm512_mullo_epi32(
@@ -1242,9 +1248,7 @@ class DequantGemmTPP {
       long lda,
       long ldc,
       int unroll_hint = 1,
-      long str_a = 1) {
-    TLA_ASSERT(false, "not implemented");
-  }
+      long str_a = 1) {}
 
   void operator()(
       Tin* A,
@@ -1609,10 +1613,13 @@ class DequantGemmTPP<
       int8_t B[K / 4][N][4];
       int32_t qC[M][N];
       int32_t compensation[N];
-      // TODO(jgong5): add prefetch
       Dequantize<int8_t, ldb, N_GROUP_SIZE, /*qw_type*/ QINT4>::call(
           qB, K, N, zps, B[0][0], compensation);
       (*pgemm)((int8_t*)qA[0], B[0][0], qC[0], 1, no_tile_cfg);
+      if constexpr (PREFETCH_K_DIST > 0) {
+        _mm_prefetch(qB + K * N, _MM_HINT_T0);
+        _mm_prefetch(A + K * M, _MM_HINT_T0);
+      }
       // post-op and convert back to C
       for (long m = 0; m < M; ++m) {
 #pragma omp simd
@@ -1625,17 +1632,17 @@ class DequantGemmTPP<
               quant_a_mode == QUANT_A_PER_M_SYM ||
               quant_a_mode == QUANT_A_PER_M_K_BLOCK_SYM) {
             scale_a_m = scale_a + m * k_groups;
-            if (zp_a) {
+            if constexpr (is_asymmetric_quant_a(quant_a_mode)) {
               zp_a_m = zp_a + m * k_groups;
             }
           } else {
             scale_a_m = scale_a;
-            if (zp_a) {
+            if constexpr (is_asymmetric_quant_a(quant_a_mode)) {
               zp_a_m = zp_a;
             }
           }
           float c = 0;
-          if (zp_a_m) {
+          if constexpr (is_asymmetric_quant_a(quant_a_mode)) {
             c = (qC[m][n] - compensation[n] * (*zp_a_m)) * (*scale_a_m) *
                 scales[n];
           } else {
@@ -1646,6 +1653,130 @@ class DequantGemmTPP<
           } else {
             C[m * ldc + n] = c;
           }
+        }
+      }
+    }
+  }
+
+  void config() {
+    if (pgemm) {
+      pgemm->config();
+    }
+  }
+
+  void release() {
+    if (pgemm) {
+      pgemm->release();
+    }
+  }
+
+ private:
+  TBrgemmTPP* pgemm;
+  long M;
+  long K;
+  long lda;
+  long ldc;
+};
+
+template <
+    long BLOCK_M,
+    long N,
+    long ldb,
+    bool transA,
+    bool ACC,
+    int quant_a_mode,
+    int quant_w_mode,
+    long PREFETCH_K_DIST>
+class NoDequantGemmTPP {
+  using TBrgemmTPP = BrgemmTPP<int8_t, int32_t>;
+
+ public:
+  NoDequantGemmTPP(
+      long M,
+      long K,
+      long lda,
+      long ldc,
+      int unroll_hint = 1,
+      long str_a = 1)
+      : M(M), K(K), lda(lda), ldc(ldc) {
+    static_assert(N % 16 == 0, "N must be a multiple of 16");
+    TLA_ASSERT(K % 4 == 0, "Kb must be a multiple of 4 for int8 VNNI");
+    // set is_sym_quant true if quant_a_mode is larger than
+    // QUANT_A_PER_TENSOR_SYM
+    constexpr bool is_sym_quant = quant_a_mode >= QUANT_A_PER_TENSOR_SYM;
+    pgemm = new TBrgemmTPP(
+        M,
+        N,
+        K,
+        K,
+        K * N,
+        lda,
+        N,
+        N,
+        /*ACC*/ 0,
+        /*transA*/ false,
+        unroll_hint,
+        /*b_vnni*/ true,
+        is_sym_quant);
+  }
+
+  ~NoDequantGemmTPP() {
+    delete pgemm;
+  }
+
+  inline void operator()(
+      uint8_t* A,
+      int8_t* B,
+      int32_t* compensation,
+      float* scales,
+      int8_t* zps,
+      float* C,
+      bool no_tile_cfg = true,
+      float* scale_a = nullptr,
+      int32_t* zp_a = nullptr,
+      int32_t k_groups = -1,
+      int32_t count = 1,
+      int kc_start = 0,
+      int quant_block_multiple = 1) {
+    auto qA = GetVLAPtr<uint8_t>(A, {lda});
+    constexpr const int N_GROUP_SIZE = 16;
+    int32_t qC[M][N];
+    if constexpr (PREFETCH_K_DIST > 0) {
+      _mm_prefetch(B + N * K, _MM_HINT_T0);
+    }
+    (*pgemm)((int8_t*)qA[0], B, qC[0], 1, no_tile_cfg);
+    // post-op and convert back to C
+    for (long m = 0; m < M; ++m) {
+#pragma omp simd
+      for (long n = 0; n < N; ++n) {
+        float* scale_a_m;
+        int32_t* zp_a_m;
+        if constexpr (
+            quant_a_mode == QUANT_A_PER_M ||
+            quant_a_mode == QUANT_A_PER_M_K_BLOCK ||
+            quant_a_mode == QUANT_A_PER_M_SYM ||
+            quant_a_mode == QUANT_A_PER_M_K_BLOCK_SYM) {
+          scale_a_m = scale_a + m * k_groups;
+          if constexpr (is_asymmetric_quant_a(quant_a_mode)) {
+            zp_a_m = zp_a + m * k_groups;
+          }
+        } else {
+          scale_a_m = scale_a;
+          if constexpr (is_asymmetric_quant_a(quant_a_mode)) {
+            zp_a_m = zp_a;
+          }
+        }
+        float c = 0;
+        if constexpr (is_asymmetric_quant_a(quant_a_mode)) {
+          c = (qC[m][n] - compensation[n] * (*zp_a_m)) * (*scale_a_m) *
+              scales[n];
+        } else {
+          c = (qC[m][n]) * (*scale_a_m) * scales[n];
+        }
+        if constexpr (ACC) {
+          C[m * ldc + n] += c;
+        } else {
+          C[m * ldc + n] = c;
         }
       }
     }
@@ -1736,7 +1867,7 @@ void qlinear_woq_affine_dequant_upfront_impl(
       std::tuple</*qw_type*/ int, /*BLOCK_N*/ long>,
       std::tuple<
           enumerate_dispatcher<int, QINT8, QINT4, NF4>,
-          enumerate_dispatcher<long, 16, 32, 64, 128>>>::
+          enumerate_dispatcher<long, 32>>>::
       call(
           std::make_tuple(qw_type, Nb),
           [&](auto tuple) {
@@ -2054,12 +2185,22 @@ void qlinear_woq_affine_impl(
     int64_t quant_block_k,
     const std::optional<at::Tensor>& zps = std::nullopt, // dtype is TComp
     float* scales_a_ptr = nullptr,
-    int32_t* zps_a_ptr = nullptr) {
+    int32_t* zps_a_ptr = nullptr,
+    const c10::optional<at::Tensor>& compensation = c10::nullopt) {
   const bool is_4bit_flag = is_4bit(qw_type);
   const bool sym_quant = is_sym_quant(qw_type);
+  bool no_dequant_weight = compensation.has_value();
+  if (no_dequant_weight) {
+    TLA_ASSERT(
+        (std::is_same<TComp, uint8_t>() && k_splits <= 1),
+        "WOQ: TComp should be uint8 and k_splits should be <= 1 if no_dequant_weight is true");
+  }
+  constexpr bool is_int8_linear =
+      (std::is_same<T, int8_t>() || std::is_same<T, uint8_t>()) &&
+      std::is_same<TComp, uint8_t>();
   auto w_sizes = qw_packed.sizes();
   auto Nc = w_sizes[0];
-  auto Nb = is_4bit_flag ? w_sizes[3] * 2 : w_sizes[3];
+  auto Nb = (is_4bit_flag && !no_dequant_weight) ? w_sizes[3] * 2 : w_sizes[3];
   auto Kc = w_sizes[1];
   auto Kb = w_sizes[2];
   auto N = Nc * Nb;
@@ -2104,8 +2245,13 @@ void qlinear_woq_affine_impl(
   auto BLOCK_M = [&]() -> long {
     if (M < 32) {
       return M;
+    } else if (M < 48) {
+      int64_t block_size = (M + 1) / 2;
+      return block_size % 2 == 0 ? block_size : block_size + 1;
     } else if (M < 64) {
       return 32;
+    } else if (M < 96) {
+      return 48;
     } else {
       return 64;
     }
@@ -2133,14 +2279,17 @@ void qlinear_woq_affine_impl(
   auto Kcb = Kc;
   if (M < PARALLEL_M_THRESHOLD) {
     Kcb = 1;
-  } else if (is_4bit_flag || !std::is_same<T, TComp>()) {
+  } else if (
+      is_4bit_flag || !std::is_same<T, TComp>() ||
+      std::is_same<TComp, uint8_t>()) {
     Kcb = 1;
   } else if (M >= PARALLEL_M_THRESHOLD) {
     Kcb = IPEX_KCB_BLOCK_SIZE;
   }
   auto px = GetVLAPtr<T>(x, {Kc, Kb});
   auto pw = GetVLAPtr<uint8_t>(
-      (uint8_t*)qw_packed.data_ptr(), {Kc, Kb * (is_4bit_flag ? Nb / 2 : Nb)});
+      (uint8_t*)qw_packed.data_ptr(),
+      {Kc, Kb * ((is_4bit_flag && !no_dequant_weight) ? Nb / 2 : Nb)});
   auto py = GetVLAPtr<Tout>(y, {Nc, Nb}); /*[M, Nc, Nb]*/
   int scales_kc = quant_w_mode == QUANT_W_PER_CHANNEL ? QUANT_W_PER_K_BLOCK
                                                       : quant_k_blocks;
@@ -2152,6 +2301,10 @@ void qlinear_woq_affine_impl(
   auto pin0 = GetVLAPtr<Tout>(tin0, {Nc, Nb}); /*[M, Nc, Nb]*/
   auto tin1 = others_list.size() > 1 ? others_list[1] : at::Tensor{};
   auto pin1 = GetVLAPtr<Tout>(tin1, {Nc, Nb}); /*[M, Nc, Nb]*/
+  auto pcomp = no_dequant_weight
+      ? GetVLAPtr<int32_t>(compensation.value(), {Kc, Nb})
+      : /*[Nc, Kc, Nb]*/
+      GetVLAPtr<int32_t>(nullptr, {1, 1});
 
   auto copy_bias_out_tpp = CpyBiasTPP<TGemmOut>(BLOCK_M, Nb, ldy);
   auto copy_bias_buf_tpp = CpyBiasTPP<TGemmOut>(BLOCK_M, Nb, Nb);
@@ -2220,99 +2373,101 @@ void qlinear_woq_affine_impl(
     }
   };
 
+#define GET_DEQUANT_GEMM_TPP(prefetch_dist, block_m) \
+  DequantGemmTPP<                                    \
+      TComp,                                         \
+      TGemmOut,                                      \
+      TScale,                                        \
+      TZero,                                         \
+      MICRO_BLOCK_M,                                 \
+      BLOCK_N,                                       \
+      /*ldb*/ BLOCK_N,                               \
+      /*transA*/ false,                              \
+      /*ACC*/ true,                                  \
+      qw_type,                                       \
+      quant_a_mode,                                  \
+      quant_w_mode,                                  \
+      prefetch_dist>(                                \
+      /*M*/ block_m, /*K*/ Kb, lda, ldc, IPEX_KCB_BLOCK_SIZE, str_a);
+
+#define GET_NO_DEQUANT_GEMM_TPP(prefetch_dist, block_m) \
+  NoDequantGemmTPP<                                     \
+      MICRO_BLOCK_M,                                    \
+      BLOCK_N,                                          \
+      /*ldb*/ BLOCK_N,                                  \
+      /*transA*/ false,                                 \
+      /*ACC*/ true,                                     \
+      quant_a_mode,                                     \
+      quant_w_mode,                                     \
+      prefetch_dist>(                                   \
+      /*M*/ block_m, /*K*/ Kb, lda, ldc, IPEX_KCB_BLOCK_SIZE, str_a);
+
+#define RUN_DEQUANT_GEMM_TPP(                                 \
+    gemm_kernel, no_tile_cfg, kc_start, quant_block_multiple) \
+  gemm_kernel(                                                \
+      x_ptr,                                                  \
+      pw[nc][kc],                                             \
+      scale_w,                                                \
+      zp_w,                                                   \
+      y_ptr,                                                  \
+      no_tile_cfg,                                            \
+      scale_a,                                                \
+      zp_a,                                                   \
+      k_groups,                                               \
+      count,                                                  \
+      kc_start,                                               \
+      quant_block_multiple);
+
+#define RUN_NO_DEQUANT_GEMM_TPP(                              \
+    gemm_kernel, no_tile_cfg, kc_start, quant_block_multiple) \
+  if constexpr (is_int8_linear)                               \
+    gemm_kernel(                                              \
+        x_ptr,                                                \
+        (int8_t*)pw[nc][kc],                                  \
+        pcomp[nc][kc],                                        \
+        scale_w,                                              \
+        zp_w,                                                 \
+        y_ptr,                                                \
+        no_tile_cfg,                                          \
+        scale_a,                                              \
+        zp_a,                                                 \
+        k_groups,                                             \
+        count,                                                \
+        kc_start,                                             \
+        quant_block_multiple);
+
   constexpr long MICRO_BLOCK_M = 8;
   product_dispatcher<
-      std::tuple</*BLOCK_N*/ long, /*qw_type*/ int>,
+      std::tuple</*BLOCK_N*/ long, /*qw_type*/ int, /*no_dequant_weight*/ bool>,
       std::tuple<
-          enumerate_dispatcher<long, 16, 32, 64, 128>,
-          enumerate_dispatcher<int, QINT8, QINT4, NF4>>>::
+          enumerate_dispatcher<long, 32>,
+          enumerate_dispatcher<int, QINT8, QINT4, NF4>,
+          enumerate_dispatcher<bool, false, true>>>::
       call(
-          std::make_tuple(Nb, qw_type),
+          std::make_tuple(Nb, qw_type, no_dequant_weight),
           [&](auto tuple) {
             auto BLOCK_N = std::get<0>(tuple);
             auto qw_type = std::get<1>(tuple);
+            auto no_dequant_w = std::get<2>(tuple);
             // TODO(jgong5): design API to avoid duplicate code of defining
             // similar kernel object
-            auto dequant_gemm_tpp = DequantGemmTPP<
-                TComp,
-                TGemmOut,
-                TScale,
-                TZero,
-                MICRO_BLOCK_M,
-                BLOCK_N,
-                /*ldb*/ BLOCK_N,
-                /*transA*/ false,
-                /*ACC*/ true,
-                qw_type,
-                quant_a_mode,
-                quant_w_mode,
-                PREFETCH_K_DIST>(
-                /*M*/ BLOCK_M,
-                /*K*/ Kb,
-                /*lda*/ lda,
-                /*ldc*/ ldc,
-                /*unroll_hint*/ IPEX_KCB_BLOCK_SIZE,
-                str_a);
-            auto dequant_gemm_no_prefetch_tpp = DequantGemmTPP<
-                TComp,
-                TGemmOut,
-                TScale,
-                TZero,
-                MICRO_BLOCK_M,
-                BLOCK_N,
-                /*ldb*/ BLOCK_N,
-                /*transA*/ false,
-                /*ACC*/ true,
-                qw_type,
-                quant_a_mode,
-                quant_w_mode,
-                0>(
-                /*M*/ BLOCK_M,
-                /*K*/ Kb,
-                /*lda*/ lda,
-                /*ldc*/ ldc,
-                IPEX_KCB_BLOCK_SIZE,
-                str_a);
-            auto dequant_gemm_rem_tpp = DequantGemmTPP<
-                TComp,
-                TGemmOut,
-                TScale,
-                TZero,
-                MICRO_BLOCK_M,
-                BLOCK_N,
-                /*ldb*/ BLOCK_N,
-                /*transA*/ false,
-                /*ACC*/ true,
-                qw_type,
-                quant_a_mode,
-                quant_w_mode,
-                PREFETCH_K_DIST>(
-                /*M*/ BLOCK_M_rem,
-                /*K*/ Kb,
-                /*lda*/ lda,
-                /*ldc*/ ldc,
-                IPEX_KCB_BLOCK_SIZE,
-                str_a);
-            auto dequant_gemm_no_prefetch_rem_tpp = DequantGemmTPP<
-                TComp,
-                TGemmOut,
-                TScale,
-                TZero,
-                MICRO_BLOCK_M,
-                BLOCK_N,
-                /*ldb*/ BLOCK_N,
-                /*transA*/ false,
-                /*ACC*/ true,
-                qw_type,
-                quant_a_mode,
-                quant_w_mode,
-                0>(
-                /*M*/ BLOCK_M_rem,
-                /*K*/ Kb,
-                /*lda*/ lda,
-                /*ldc*/ ldc,
-                IPEX_KCB_BLOCK_SIZE,
-                str_a);
+            auto dequant_gemm_tpp =
+                GET_DEQUANT_GEMM_TPP(PREFETCH_K_DIST, BLOCK_M);
+            auto dequant_gemm_no_prefetch_tpp =
+                GET_DEQUANT_GEMM_TPP(0, BLOCK_M);
+            auto dequant_gemm_rem_tpp =
+                GET_DEQUANT_GEMM_TPP(PREFETCH_K_DIST, BLOCK_M_rem);
+            auto dequant_gemm_no_prefetch_rem_tpp =
+                GET_DEQUANT_GEMM_TPP(0, BLOCK_M_rem);
+
+            auto no_dequant_gemm_tpp =
+                GET_NO_DEQUANT_GEMM_TPP(PREFETCH_K_DIST, BLOCK_M);
+            auto no_dequant_gemm_no_prefetch_tpp =
+                GET_NO_DEQUANT_GEMM_TPP(0, BLOCK_M);
+            auto no_dequant_gemm_rem_tpp =
+                GET_NO_DEQUANT_GEMM_TPP(PREFETCH_K_DIST, BLOCK_M_rem);
+            auto no_dequant_gemm_no_prefetch_rem_tpp =
+                GET_NO_DEQUANT_GEMM_TPP(0, BLOCK_M_rem);
 
             auto pcvt_x_tpp =
                 std::is_same<T, uint8_t>() || std::is_same<T, int8_t>()
@@ -2417,29 +2572,20 @@ void qlinear_woq_affine_impl(
                       }
                       TComp* x_ptr = (TComp*)px[m][kc];
                       if (kc < Kc - 1) {
-                        dequant_gemm_tpp(
-                            x_ptr,
-                            pw[nc][kc],
-                            scale_w,
-                            zp_w,
-                            y_ptr,
-                            true,
-                            scale_a,
-                            zp_a,
-                            k_groups,
-                            count);
+                        if constexpr (no_dequant_w) {
+                          RUN_NO_DEQUANT_GEMM_TPP(
+                              no_dequant_gemm_tpp, true, 0, 1);
+                        } else {
+                          RUN_DEQUANT_GEMM_TPP(dequant_gemm_tpp, true, 0, 1);
+                        }
                       } else {
-                        dequant_gemm_no_prefetch_tpp(
-                            x_ptr,
-                            pw[nc][kc],
-                            scale_w,
-                            zp_w,
-                            y_ptr,
-                            true,
-                            scale_a,
-                            zp_a,
-                            k_groups,
-                            count);
+                        if constexpr (no_dequant_w) {
+                          RUN_NO_DEQUANT_GEMM_TPP(
+                              no_dequant_gemm_no_prefetch_tpp, true, 0, 1);
+                        } else {
+                          RUN_DEQUANT_GEMM_TPP(
+                              dequant_gemm_no_prefetch_tpp, true, 0, 1);
+                        }
                         if (fusion_type > 0) {
                           post_ops_fn(m, nc);
                         }
@@ -2454,31 +2600,25 @@ void qlinear_woq_affine_impl(
                       }
                       TComp* x_ptr = (TComp*)px[m][kc];
                       if (kc < Kc - 1) {
-                        dequant_gemm_rem_tpp(
-                            x_ptr,
-                            pw[nc][kc],
-                            scale_w,
-                            zp_w,
-                            y_ptr,
-                            false,
-                            scale_a,
-                            zp_a,
-                            k_groups,
-                            count);
-                        dequant_gemm_tpp.config();
+                        if constexpr (no_dequant_w) {
+                          RUN_NO_DEQUANT_GEMM_TPP(
+                              no_dequant_gemm_rem_tpp, false, 0, 1);
+                          no_dequant_gemm_tpp.config();
+                        } else {
+                          RUN_DEQUANT_GEMM_TPP(
+                              dequant_gemm_rem_tpp, false, 0, 1);
+                          dequant_gemm_tpp.config();
+                        }
                       } else {
-                        dequant_gemm_no_prefetch_rem_tpp(
-                            x_ptr,
-                            pw[nc][kc],
-                            scale_w,
-                            zp_w,
-                            y_ptr,
-                            false,
-                            scale_a,
-                            zp_a,
-                            k_groups,
-                            count);
-                        dequant_gemm_no_prefetch_tpp.config();
+                        if constexpr (no_dequant_w) {
+                          RUN_NO_DEQUANT_GEMM_TPP(
+                              no_dequant_gemm_no_prefetch_rem_tpp, false, 0, 1);
+                          no_dequant_gemm_no_prefetch_tpp.config();
+                        } else {
+                          RUN_DEQUANT_GEMM_TPP(
+                              dequant_gemm_no_prefetch_rem_tpp, false, 0, 1);
+                          dequant_gemm_no_prefetch_tpp.config();
+                        }
                         if (fusion_type > 0) {
                           post_ops_rem_fn(m, nc);
                         }
@@ -2486,9 +2626,21 @@ void qlinear_woq_affine_impl(
                     }
                     // TODO(jgong5): post-op fusion
                   },
-                  [&]() { dequant_gemm_tpp.config(); },
-                  [&]() { dequant_gemm_tpp.release(); });
-            } else {
+                  [&]() {
+                    if constexpr (no_dequant_w) {
+                      no_dequant_gemm_tpp.config();
+                    } else {
+                      dequant_gemm_tpp.config();
+                    }
+                  },
+                  [&]() {
+                    if constexpr (no_dequant_w) {
+                      no_dequant_gemm_tpp.release();
+                    } else {
+                      dequant_gemm_tpp.release();
+                    }
+                  });
+            } else { // no_y_buf is false
               auto num_threads = omp_get_max_threads();
               TGemmOut* y_private = nullptr;
               bool* y_private_valid = nullptr;
@@ -2505,7 +2657,12 @@ void qlinear_woq_affine_impl(
               auto y_private_ptr = GetVLAPtr<TGemmOut>(y_private, {M, Nc, Nb});
               auto y_private_valid_ptr =
                   GetVLAPtr<bool>(y_private_valid, {M / BLOCK_M, Nc});
-              auto loop_scheme = M >= PARALLEL_M_THRESHOLD ? "CAB" : "ABc";
+              static const char* SCHEME_LARGE_M =
+                  getenv("IPEX_WOQ_GEMM_LOOP_SCHEME")
+                  ? getenv("IPEX_WOQ_GEMM_LOOP_SCHEME")
+                  : "CAB";
+              auto loop_scheme =
+                  M >= PARALLEL_M_THRESHOLD ? SCHEME_LARGE_M : "ABc";
               auto gemm_loop = ThreadedLoop<3>(
                   {{Nc}, {0, Kc, Kc / k_splits, true}, {0, M, BLOCK_M, false}},
                   loop_scheme);
@@ -2611,33 +2768,33 @@ void qlinear_woq_affine_impl(
                         }
 
                         if (kc < Kc - 1) {
-                          dequant_gemm_tpp(
-                              x_ptr,
-                              pw[nc][kc],
-                              scale_w,
-                              zp_w,
-                              y_ptr,
-                              true,
-                              scale_a,
-                              zp_a,
-                              k_groups,
-                              count,
-                              kc,
-                              quant_block_multiple);
+                          if constexpr (no_dequant_w) {
+                            RUN_NO_DEQUANT_GEMM_TPP(
+                                no_dequant_gemm_tpp,
+                                true,
+                                kc,
+                                quant_block_multiple);
+                          } else {
+                            RUN_DEQUANT_GEMM_TPP(
+                                dequant_gemm_tpp,
+                                true,
+                                kc,
+                                quant_block_multiple);
+                          }
                         } else {
-                          dequant_gemm_no_prefetch_tpp(
-                              x_ptr,
-                              pw[nc][kc],
-                              scale_w,
-                              zp_w,
-                              y_ptr,
-                              true,
-                              scale_a,
-                              zp_a,
-                              k_groups,
-                              count,
-                              kc,
-                              quant_block_multiple);
+                          if constexpr (no_dequant_w) {
+                            RUN_NO_DEQUANT_GEMM_TPP(
+                                no_dequant_gemm_no_prefetch_tpp,
+                                true,
+                                kc,
+                                quant_block_multiple);
+                          } else {
+                            RUN_DEQUANT_GEMM_TPP(
+                                dequant_gemm_no_prefetch_tpp,
+                                true,
+                                kc,
+                                quant_block_multiple);
+                          }
                         }
                       } else {
                         alignas(64) TComp x_buf[count][BLOCK_M][Kb];
@@ -2648,35 +2805,37 @@ void qlinear_woq_affine_impl(
                           x_ptr = x_buf[0][0];
                         }
                         if (kc < Kc - 1) {
-                          dequant_gemm_rem_tpp(
-                              x_ptr,
-                              pw[nc][kc],
-                              scale_w,
-                              zp_w,
-                              y_ptr,
-                              false,
-                              scale_a,
-                              zp_a,
-                              k_groups,
-                              count,
-                              kc,
-                              quant_block_multiple);
-                          dequant_gemm_tpp.config();
+                          if constexpr (no_dequant_w) {
+                            RUN_NO_DEQUANT_GEMM_TPP(
+                                no_dequant_gemm_rem_tpp,
+                                false,
+                                kc,
+                                quant_block_multiple);
+                            no_dequant_gemm_tpp.config();
+                          } else {
+                            RUN_DEQUANT_GEMM_TPP(
+                                dequant_gemm_rem_tpp,
+                                false,
+                                kc,
+                                quant_block_multiple);
+                            dequant_gemm_tpp.config();
+                          }
                         } else {
-                          dequant_gemm_no_prefetch_rem_tpp(
-                              x_ptr,
-                              pw[nc][kc],
-                              scale_w,
-                              zp_w,
-                              y_ptr,
-                              false,
-                              scale_a,
-                              zp_a,
-                              k_groups,
-                              count,
-                              kc,
-                              quant_block_multiple);
-                          dequant_gemm_no_prefetch_tpp.config();
+                          if constexpr (no_dequant_w) {
+                            RUN_NO_DEQUANT_GEMM_TPP(
+                                no_dequant_gemm_no_prefetch_rem_tpp,
+                                false,
+                                kc,
+                                quant_block_multiple);
+                            no_dequant_gemm_no_prefetch_tpp.config();
+                          } else {
+                            RUN_DEQUANT_GEMM_TPP(
+                                dequant_gemm_no_prefetch_rem_tpp,
+                                false,
+                                kc,
+                                quant_block_multiple);
+                            dequant_gemm_no_prefetch_tpp.config();
+                          }
                         }
                       }
                     }
@@ -2695,8 +2854,20 @@ void qlinear_woq_affine_impl(
                       }
                     }
                   },
-                  [&]() { dequant_gemm_tpp.config(); },
-                  [&]() { dequant_gemm_tpp.release(); });
+                  [&]() {
+                    if constexpr (no_dequant_w) {
+                      no_dequant_gemm_tpp.config();
+                    } else {
+                      dequant_gemm_tpp.config();
+                    }
+                  },
+                  [&]() {
+                    if constexpr (no_dequant_w) {
+                      no_dequant_gemm_tpp.release();
+                    } else {
+                      dequant_gemm_tpp.release();
+                    }
+                  });
               if (k_splits > 1) {
                 TLA_ASSERT(
                     M % BLOCK_M == 0,
@@ -2803,9 +2974,13 @@ at::Tensor qlinear_woq_pack(
     });
     return result;
   } else {
-    TLA_ASSERT(
-        lowp_mode != LOWP_MODE_INT8,
-        "lowp mode int8 is not supported yet with int8 weight");
+    if (lowp_mode == LOWP_MODE_INT8) {
+      // pack weight o [Nc, Kc, Kb/4, Nb, 4] but view it as [Nc, Kc, Kb, Nb]
+      auto packed_weight = qw.reshape({Nc, block_n, Kc, block_k / 4, 4})
+                               .permute({0, 2, 3, 1, 4})
+                               .contiguous();
+      return packed_weight.view({Nc, Kc, block_k, block_n});
+    }
     auto result = at::empty({Nc, Kc, block_k, block_n}, qw.options());
     // Pack weight in [N,K] to [N/block_n, K/block_k, block_k, block_n]
     int8_t* src_data = (int8_t*)qw.data_ptr();
@@ -4098,7 +4273,8 @@ at::Tensor qlinear_woq_affine(
     const TensorList& others_list,
     int64_t quant_a_mode = -1,
     int64_t quant_w_mode = 0,
-    int64_t quant_block_k = 0) {
+    int64_t quant_block_k = 0,
+    const c10::optional<at::Tensor>& compensation = c10::nullopt) {
   const int64_t k_splits = 0;
   // int8_idx is only valid with zp_list when lowp_mode == LOWP_MODE_INT8
   constexpr size_t fp32_idx = 0, fp16_idx = 1, bf16_idx = 2, int8_idx = 3;
@@ -4112,7 +4288,7 @@ at::Tensor qlinear_woq_affine(
     auto K = x.size(-1);
     auto M = x.numel() / K;
     auto N = w_sizes[0] * w_sizes[3];
-    if (is_4bit_flag) {
+    if (is_4bit_flag && !compensation.has_value()) {
       N *= 2;
     }
     auto out_sizes = x.sizes().vec();
@@ -4366,9 +4542,10 @@ at::Tensor qlinear_woq_affine(
               } else {
                 TLA_ASSERT(lowp_mode == LOWP_MODE_INT8, "invalid lowp_mode");
                 TLA_ASSERT(
-                    qw_type == QINT4,
-                    "LOWP_MODE_INT8 only support qw_type = QINT4");
-                TLA_ASSERT(!sym_quant, "qw_type = QINT4 is asymmetric quant");
+                    qw_type == QINT4 || qw_type == QINT8,
+                    "LOWP_MODE_INT8 only support qw_type = QINT4 or QINT8");
+                // TLA_ASSERT(!sym_quant, "qw_type = QINT4 is asymmetric
+                // quant");
                 if (quant_a_mode == QUANT_A_PER_TENSOR) {
                   float scale_a;
                   int32_t zp_a;
@@ -4397,7 +4574,8 @@ at::Tensor qlinear_woq_affine(
                       quant_block_k,
                       zp_list[int8_idx],
                       &scale_a,
-                      &zp_a);
+                      &zp_a,
+                      compensation);
                 } else if (quant_a_mode == QUANT_A_PER_TENSOR_SYM) {
                   float scale_a;
                   int32_t zp_a;
@@ -4426,7 +4604,8 @@ at::Tensor qlinear_woq_affine(
                       quant_block_k,
                       zp_list[int8_idx],
                       &scale_a,
-                      &zp_a);
+                      &zp_a,
+                      compensation);
                 } else if (
                     quant_a_mode == QUANT_A_PER_K_BLOCK ||
                     quant_a_mode == QUANT_A_PER_M_K_BLOCK ||
@@ -4469,7 +4648,8 @@ at::Tensor qlinear_woq_affine(
                                 quant_block_k,
                                 zp_list[int8_idx],
                                 scale_a_ptr,
-                                zp_a_ptr);
+                                zp_a_ptr,
+                                compensation);
                           },
                           [&](auto quant_a_mode_) { failing_fallback(); });
                 } else {
@@ -4511,7 +4691,8 @@ at::Tensor qlinear_woq_affine(
                                 quant_block_k,
                                 zp_list[int8_idx],
                                 scale_a_ptr,
-                                zp_a_ptr);
+                                zp_a_ptr,
+                                compensation);
                           },
                           [&](auto quant_a_mode_) { failing_fallback(); });
                 }
@@ -4538,7 +4719,7 @@ at::Tensor qlinear_woq_affine(
       zp = zp_list[fp32_idx].unsqueeze(-1);
     }
     auto w = torch_ipex::cpu::dequantize_woq_weight(
-                 qw, {N, K}, scale, zp, qw_type, quant_w_mode)
+                 qw, {N, K}, scale, zp, qw_type, quant_block_k)
                  .to(compute_dtype);
     auto x_reshape = x.reshape({M, K});
     auto x_fp = x_reshape.to(compute_dtype);
@@ -4581,6 +4762,82 @@ at::Tensor qlinear_woq_affine(
   }
 }
 
+/*
+Take an int4 weight in blocked format. Dequantize it and subtract compensation
+per block. The returned tensor is still in block format. Compensation is also
+returned through the argument.
+*/
+at::Tensor dequantize_int4_weight_to_int8_packed(
+    const at::Tensor& qw_packed,
+    const at::Tensor& scales,
+    const at::Tensor& zps,
+    int quant_block_k,
+    int64_t quant_w_mode,
+    at::Tensor& compensation) {
+  auto w_sizes = qw_packed.sizes();
+  auto Nc = w_sizes[0];
+  auto Kc = w_sizes[1];
+  auto Kb = w_sizes[2];
+  auto Nb = w_sizes[3] * 2;
+  auto N = Nc * Nb;
+  auto K = Kc * Kb;
+  TLA_ASSERT(
+      compensation.sizes().vec() == std::vector<int64_t>({Nc, Kc, Nb}),
+      "WOQ linear: compensation size mismatch");
+  constexpr const long MICRO_BLOCK_M = 8;
+  constexpr const int N_GROUP_SIZE = 16;
+  auto quant_block_multiple = quant_block_k == 0 ? 1 : quant_block_k / Kb;
+  auto quant_k_blocks =
+      quant_block_k == 0 ? 1 : (K + quant_block_k - 1) / quant_block_k;
+  int scales_kc = quant_w_mode == QUANT_W_PER_CHANNEL ? QUANT_W_PER_K_BLOCK
+                                                      : quant_k_blocks;
+  auto pw =
+      GetVLAPtr<uint8_t>((uint8_t*)qw_packed.data_ptr(), {Kc, Kb * Nb / 2});
+  auto pscales = GetVLAPtr<float>(scales, {scales_kc, Nb});
+  auto pzps = GetVLAPtr<int8_t>(zps, {scales_kc, Nb});
+  torch::Tensor dqw = torch::empty({Nc, Kc, Kb, Nb}, c10::kChar);
+  auto dqw_ptr = GetVLAPtr<int8_t>(dqw, {Kc, Kb * Nb});
+  auto comp_ptr = GetVLAPtr<int32_t>(compensation, {Kc, Nb});
+
+  enumerate_dispatcher<long, 16, 32, 64, 128>::call(
+      Nb,
+      [&](auto block_n) {
+        auto loop_scheme = "bA";
+        auto dequant_loop = ThreadedLoop<2>({{Nc}, {0, Kc, Kc}}, loop_scheme);
+        dequant_loop(
+            [&](int* idx) {
+              int nc = idx[0];
+              int kc_start = idx[1];
+              int kc_end = kc_start + Kc;
+              for (int kc = kc_start; kc < kc_end; kc++) {
+                // int32_t k_groups = -1;
+                int32_t quant_offset = kc / quant_block_multiple;
+                float* scale_w = nullptr;
+                int8_t* zp_w = nullptr;
+                if (quant_w_mode == QUANT_W_PER_CHANNEL) {
+                  scale_w = pscales[nc][0];
+                  zp_w = pzps[nc][0];
+                } else {
+                  scale_w = pscales[nc][quant_offset];
+                  zp_w = pzps[nc][quant_offset];
+                }
+                Dequantize<int8_t, block_n, N_GROUP_SIZE, /*qw_type*/ QINT4>::
+                    call(
+                        pw[nc][kc],
+                        Kb,
+                        block_n,
+                        zp_w,
+                        dqw_ptr[nc][kc],
+                        comp_ptr[nc][kc]);
+              }
+            },
+            [&]() {},
+            [&]() {});
+      },
+      [](auto tuple) { failing_fallback(); });
+  return dqw;
+}
+
 #else // defined(CPU_CAPABILITY_AVX512_FP16) && defined(COMPILER_PREREQ_MET)
 
 #define SMALL_BATCH_THRESHOLD 32
@@ -4597,7 +4854,8 @@ at::Tensor qlinear_woq_affine(
     const TensorList& others_list,
     int64_t quant_a_mode = -1,
     int64_t quant_w_mode = 0,
-    int64_t quant_block_k = 0) {
+    int64_t quant_block_k = 0,
+    const c10::optional<at::Tensor>& compensation = c10::nullopt) {
   constexpr size_t fp32_idx = 0, fp16_idx = 1, bf16_idx = 2, int8_idx = 3;
   auto biases = bias_list.empty()
       ? TensorList({at::Tensor(), at::Tensor(), at::Tensor()})
@@ -4620,7 +4878,7 @@ at::Tensor qlinear_woq_affine(
     zp = zp_list[fp32_idx].unsqueeze(-1);
   }
   auto w = torch_ipex::cpu::dequantize_woq_weight(
-               qw, {N, K}, scale, zp, qw_type, quant_w_mode)
+               qw, {N, K}, scale, zp, qw_type, quant_block_k)
                .to(compute_dtype);
   auto x_reshape = x.reshape({M, K});
   auto x_fp = x_reshape.to(compute_dtype);
@@ -4677,6 +4935,16 @@ at::Tensor qlinear_woq_unpack(
     int64_t lowp_mode) {
   return qw_packed;
 }
+
+at::Tensor dequantize_int4_weight_to_int8_packed(
+    const at::Tensor& qw_packed,
+    const at::Tensor& scales,
+    const at::Tensor& zps,
+    int quant_block_k,
+    int64_t quant_w_mode,
+    at::Tensor& compensation) {
+  return qw_packed;
+}
 #endif // defined(CPU_CAPABILITY_AVX512_FP16) && defined(COMPILER_PREREQ_MET)
 
 } // namespace
@@ -4684,6 +4952,9 @@ at::Tensor qlinear_woq_unpack(
 IPEX_REGISTER_DISPATCH(woq_tpp_gemm_kernel_stub, &qlinear_woq_affine);
 IPEX_REGISTER_DISPATCH(woq_tpp_gemm_packB_stub, &qlinear_woq_pack);
 IPEX_REGISTER_DISPATCH(woq_tpp_gemm_unpackB_stub, &qlinear_woq_unpack);
+IPEX_REGISTER_DISPATCH(
+    woq_dequant_int4_to_int8_packed_stub,
+    &dequantize_int4_weight_to_int8_packed);
 
 } // namespace cpu
 } // namespace torch_ipex

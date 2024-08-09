@@ -1,3 +1,4 @@
+import os
 import argparse
 import time
 import json
@@ -252,6 +253,13 @@ parser.add_argument(
     " It brings better performance at the cost of higher memory usage. It is only valid for weight-only"
     " quantization with lowp-mode=BF16. Otherwise, it has no effect.",
 )
+parser.add_argument(
+    "--lm-head-generation",
+    action="store_true",
+    help="Compute lm-head only for the last token in the sequence to speed up first token inference."
+    " This feature is not compatible with lambada_openai accuracy test. If you want to run"
+    " lambada_openai accuracy test with the quantized model afterwards, don't turn this feature on.",
+)
 args = parser.parse_args()
 
 
@@ -389,13 +397,23 @@ else:
 
 num_beams = 1 if args.greedy else 4
 if not hasattr(config, "text_max_length") and args.prompt is None:
-    config.text_max_length = int(args.input_tokens) + int(args.max_new_tokens)
+    if not args.benchmark:
+        if hasattr(config, "max_position_embeddings"):
+            config.text_max_length = config.max_position_embeddings
+        else:
+            config.text_max_length = 2048
+    else:
+        config.text_max_length = int(args.input_tokens) + int(args.max_new_tokens)
 if model.name == "mpt" and not hasattr(config, "max_seq_len") and args.prompt is None:
     config.max_seq_len = int(args.input_tokens) + int(args.max_new_tokens)
 if model.name in ["git", "llava"]:
     config.batch_size = int(args.batch_size) * num_beams
 if model.name == "whisper":
     config.text_max_length = config.max_source_positions + config.max_target_positions
+
+if args.lm_head_generation and not hasattr(config, "lm_head_generation"):
+    config.lm_head_generation = True
+
 
 user_model = model.get_user_model(config, args.benchmark)
 
@@ -1006,21 +1024,55 @@ elif args.ipex_weight_only_quantization:
         group_size=args.group_size,
     )
     if args.low_precision_checkpoint != "":
-        if args.low_precision_checkpoint.endswith(
-            ".pt"
-        ) or args.low_precision_checkpoint.endswith(".pth"):
-            low_precision_checkpoint = torch.load(args.low_precision_checkpoint)
-        elif args.low_precision_checkpoint.endswith(".safetensors"):
-            try:
-                import safetensors
-            except ImportError:
-                print(
-                    "Please install safetensors package to load safetensors checkpoint."
-                )
-                exit(1)
-            low_precision_checkpoint = safetensors.torch.load_file(
-                args.low_precision_checkpoint
+        pathname = args.low_precision_checkpoint
+        assert os.path.exists(pathname), f"Checkpoint file does not exist: {pathname}"
+        if os.path.isfile(pathname):
+            low_precision_checkpoint = None
+            if pathname.endswith(".pt") or pathname.endswith(".pth"):
+                low_precision_checkpoint = torch.load(pathname, weights_only=True)
+            elif pathname.endswith(".safetensors"):
+                try:
+                    import safetensors
+                except ImportError:
+                    print(
+                        "Please install safetensors package to load safetensors checkpoint."
+                    )
+                    exit(1)
+                low_precision_checkpoint = safetensors.torch.load_file(pathname)
+            assert (
+                low_precision_checkpoint is not None
+            ), f"Invalid checkpoint file: {pathname}. Should be a .pt, .pth or .safetensors file."
+        elif os.path.isdir(pathname):
+            low_precision_checkpoint = {}
+            for pattern in ["*.pt", "*.pth"]:
+                files = list(pathlib.Path(pathname).glob(pattern))
+                if files:
+                    for f in files:
+                        data_f = torch.load(f, weights_only=True)
+                        low_precision_checkpoint.update(data_f)
+                    break
+            if not low_precision_checkpoint:
+                files = list(pathlib.Path(pathname).glob("*.safetensors"))
+                if files:
+                    try:
+                        import safetensors
+                    except ImportError:
+                        print(
+                            "Please install safetensors package to load safetensors checkpoint."
+                        )
+                        exit(1)
+                    for f in files:
+                        data_f = safetensors.torch.load_file(f)
+                        low_precision_checkpoint.update(data_f)
+            assert (
+                len(low_precision_checkpoint) > 0
+            ), f"Cannot find checkpoint (.pt/.pth/.safetensors) files in path {pathname}."
+        else:
+            raise AssertionError(
+                f"Invalid low-precision-checkpoint: {pathname}."
+                " Should be a .pt/.pth/.safetensors file or a directory containing them."
             )
+
         if args.gptq_legacy_format:
             config_dict = (
                 ipex.utils.weight_only_quantization._legacy_lowp_checkpoint_config()
@@ -1257,19 +1309,19 @@ if args.benchmark:
                 prof.step()
 
     print("\n", "-" * 10, "Summary:", "-" * 10)
-    latency = total_time / (num_iter - num_warmup)
-    print("Inference latency: %.3f sec." % latency)
+    latency = total_time / (num_iter - num_warmup) * 1000
+    print("Inference latency: %.2f ms." % latency)
     if args.token_latency:
         import numpy as np
         from itertools import chain
 
-        first_latency = np.mean([x[0] for x in total_list])
+        first_latency = np.mean([x[0] for x in total_list]) * 1000
         average_2n = list(chain(*[x[1:] for x in total_list]))
         average_2n.sort()
-        average_2n_latency = np.mean(average_2n)
-        p90_latency = average_2n[int(len(average_2n) * 0.9)]
-        p99_latency = average_2n[int(len(average_2n) * 0.99)]
-        print("First token average latency: %.3f sec." % first_latency)
-        print("Average 2... latency: %.3f sec." % average_2n_latency)
-        print("P90 2... latency: %.3f sec." % p90_latency)
-        print("P99 2... latency: %.3f sec." % p99_latency)
+        average_2n_latency = np.mean(average_2n) * 1000
+        p90_latency = average_2n[int(len(average_2n) * 0.9)] * 1000
+        p99_latency = average_2n[int(len(average_2n) * 0.99)] * 1000
+        print("First token average latency: %.2f ms." % first_latency)
+        print("Average 2... latency: %.2f ms." % average_2n_latency)
+        print("P90 2... latency: %.2f ms." % p90_latency)
+        print("P99 2... latency: %.2f ms." % p99_latency)

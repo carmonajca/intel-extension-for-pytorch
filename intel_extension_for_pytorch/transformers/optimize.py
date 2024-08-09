@@ -353,8 +353,8 @@ def model_convert_reference(_model):
     if _model.device.type == "cpu":
         from ..cpu import comm as ipex_comm
 
-        world_size = ipex_comm.get_world_size()
-        rank = ipex_comm.get_rank()
+        world_size = ipex_comm.get_world_size() if ipex_comm.has_ccl() else 1
+        rank = ipex_comm.get_rank() if ipex_comm.has_ccl else 0
         if world_size > 1:
             global distributed
             if distributed:
@@ -1054,12 +1054,13 @@ def get_dummy_input(_model, return_dict=False):
                 torch.zeros(batch_size, 1, 4096).to(_model.dtype),
                 torch.ones((batch_size, 1), dtype=torch.long),
             ) + sample_inputs[2:]
+
     if _model.config.architectures[0] == "YuanForCausalLM":
         hidden_size = _model.config.hidden_size
         if _model.device.type == "cpu":
             from ..cpu import comm as ipex_comm
 
-            world_size = ipex_comm.get_world_size()
+            world_size = ipex_comm.get_world_size() if ipex_comm.has_ccl() else 1
             hidden_size = hidden_size * world_size
         past_key_values = tuple(
             [
@@ -1424,8 +1425,8 @@ def optimize(
             It means there is no need to further apply optimization like torchscirpt. Default value is ``True``.
         cache_weight_for_large_batch (bool): Whether to cache the dedicated weight for large batch to speed up
             its inference (e.g., prefill phase) with extra memory usage. It is only valid for non-quantization cases
-            where dtype = bfloat16 and weight-only quantization cases where lowp-mode=BF16. In other cases, an error
-            will be raised. Default value is ``False``.
+            where dtype = bfloat16 and weight-only quantization cases where lowp-mode=BF16/INT8. In other cases, an
+            error will be raised. Default value is ``False``.
 
     Returns:
         Optimized model object for model.generate(), also workable with model.forward

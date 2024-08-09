@@ -910,9 +910,7 @@ def _GLM2Attention_forward(
         attention_mask,
     )
     context_layer = attn_output.permute(2, 0, 1, 3).contiguous()
-    output = context_layer.reshape(
-        context_layer.shape[0], context_layer.shape[1], self.projection_size
-    )
+    output = context_layer.reshape(context_layer.shape[0], context_layer.shape[1], -1)
     # output = self.dense(context_layer)
     return output, present
 
@@ -2170,7 +2168,8 @@ def _WhisperAttention_forward(
             else src_len
         )
         attention_mask = torch.zeros(
-            [bsz, 1, tgt_len, seq_len], dtype=hidden_states.dtype
+            [bsz, 1, tgt_len, src_len if is_cross_attention else seq_len],
+            dtype=hidden_states.dtype,
         )
     if key_value_states is None and self.is_decoder:
         decoded_tokens = (

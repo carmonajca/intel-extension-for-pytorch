@@ -4,6 +4,7 @@
 #include <torch/all.h>
 #include <torch/csrc/autograd/function.h>
 #include <limits>
+#include "../../utils/isa_utils.h"
 #include "vec/vec.h"
 
 namespace torch_ipex {
@@ -567,13 +568,13 @@ scale_dot_product_for_indirect_access_kv_cache(
       : std::max(seq_len / max_parallel_parts, 1L);
   kv_block_size = std::min(kv_block_size, target_block_size);
   auto kv_block_count = (seq_len + kv_block_size - 1) / kv_block_size;
-  auto need_update_beam_idx = offset > 0 and bs > 1;
   auto b_ptr = beam_idx.data_ptr<long>();
   auto max_cache_size = beam_idx.size(0);
   long new_beam_idx[beam_batch][offset + query.size(1) + 1] = {};
   auto prompt_len = b_ptr[(max_cache_size - 2) * beam_batch];
   auto prompt_bs = b_ptr[(max_cache_size - 1) * beam_batch];
   auto beam_size = beam_batch / prompt_bs;
+  auto need_update_beam_idx = offset > 0 and beam_size > 1;
   if (need_update_beam_idx) {
     // according to the last decoded token to get the target beam for the past
     // token
@@ -654,6 +655,8 @@ scale_dot_product_for_indirect_access_kv_cache(
                   auto beam_size = beam_batch / bs;
                   kc_t_beam_start =
                       kc_t_beam_start + bi * beam_size * kv_head * head_size;
+                } else if (beam_size == 1) {
+                  kc_t_beam_start = kc_t_beam_start + bi * kv_head * head_size;
                 }
                 auto kc_head_start =
                     k_cache_ptr + kc_t_beam_start + kv_hi * head_size;
@@ -813,6 +816,8 @@ scale_dot_product_for_indirect_access_kv_cache(
                   auto beam_size = beam_batch / bs;
                   vc_t_beam_start =
                       vc_t_beam_start + bi * beam_size * kv_head * head_size;
+                } else if (beam_size == 1) {
+                  vc_t_beam_start = vc_t_beam_start + bi * kv_head * head_size;
                 }
                 auto v_cache_head_start =
                     v_cache_ptr + vc_t_beam_start + kv_hi * head_size;
@@ -1312,15 +1317,6 @@ first_token_masked_mha(
   auto key_lenght = key.size(1);
   auto kv_head_num = key.size(2);
   auto head_size = key.size(3);
-  if (add_casual_mask) {
-    auto casual_mask = at::full(
-        {query_length, key_lenght},
-        origin_type == at::kHalf ? -6e4 : -1e6,
-        query.options());
-    casual_mask = at::triu(casual_mask, 1);
-    casual_mask = casual_mask.unsqueeze(0).unsqueeze(0);
-    attention_mask = attention_mask + casual_mask;
-  }
   if (key.scalar_type() != at::kBFloat16 && key.scalar_type() != at::kFloat &&
       key.scalar_type() != at::kHalf) {
     TORCH_CHECK(
@@ -1345,7 +1341,8 @@ first_token_masked_mha(
   auto attn_outputs = at::Tensor();
   auto attn_weights = at::Tensor();
   if ((key.scalar_type() == at::kFloat || key.scalar_type() == at::kBFloat16 ||
-       key.scalar_type() == at::kHalf) &&
+       (key.scalar_type() == at::kHalf &&
+        utils::isa_has_avx512_fp16_support())) &&
       attention_mask.stride(-1) == 1) {
     query = query.transpose(1, 2);
     key = key.transpose(1, 2);
@@ -1356,7 +1353,7 @@ first_token_masked_mha(
         key,
         value,
         /* dropout */ 0.0,
-        /* is_causal*/ false,
+        add_casual_mask,
         attention_mask,
         1. / scale_attn));
   } else {
@@ -1446,17 +1443,17 @@ masked_multihead_self_attention_kernel_impl(
         query.size(0); // record the promt bs info
 
   } else if (offset > 0 && offset + cur_len > cache_size) {
-    auto new_cache_size = cache_size * 2 + 2;
+    auto new_cache_size = cache_size * 2;
     auto new_key_cache = at::empty(
         {new_cache_size, beam_batch, key.size(2), key.size(3)}, key.options());
     auto new_value_cache = at::empty(
         {new_cache_size, beam_batch, value.size(2), value.size(3)},
         value.options());
     auto new_beam_idx =
-        at::zeros({new_cache_size, beam_batch}, beam_idx.options());
+        at::zeros({new_cache_size + 2, beam_batch}, beam_idx.options());
     new_key_cache.slice(0, 0, cache_size).copy_(key_cache);
     new_value_cache.slice(0, 0, cache_size).copy_(value_cache);
-    new_beam_idx.slice(0, 0, cache_size).copy_(beam_idx);
+    new_beam_idx.slice(0, 0, cache_size + 2).copy_(beam_idx);
     auto new_beam_idx_access = new_beam_idx.accessor<long, 2>();
     auto beam_idx_access = beam_idx.accessor<long, 2>();
     for (auto i = offset; i < new_cache_size; i++) {
@@ -1464,25 +1461,51 @@ masked_multihead_self_attention_kernel_impl(
         new_beam_idx_access[i][j] = beam_idx_access[0][j];
       }
     }
-    new_beam_idx_access[new_cache_size - 2][0] =
-        beam_idx_access[cache_size - 2][0];
-    new_beam_idx_access[new_cache_size - 1][0] =
+    new_beam_idx_access[new_cache_size][0] = beam_idx_access[cache_size - 2][0];
+    new_beam_idx_access[new_cache_size + 1][0] =
         beam_idx_access[cache_size - 1][0];
     key_cache = new_key_cache;
     value_cache = new_value_cache;
     beam_idx = new_beam_idx;
   }
-  if (offset > 0) {
-    return zero_copy_kv_cache_masked_multihead_self_attention_kernel_impl(
-        query,
-        key,
-        value,
-        key_cache,
-        value_cache,
-        beam_idx,
-        offset,
-        scale_attn,
-        attention_mask_v);
+  if (offset != 0) {
+    auto cur_len = query.size(1);
+    if (cur_len == 1)
+      return zero_copy_kv_cache_masked_multihead_self_attention_kernel_impl(
+          query,
+          key,
+          value,
+          key_cache,
+          value_cache,
+          beam_idx,
+          offset,
+          scale_attn,
+          attention_mask_v);
+    // just a  funcationality path,need to optimize
+    auto tokens_outs = std::vector<at::Tensor>(cur_len);
+    for (auto i = 0; i < cur_len; i++) {
+      auto query_i = query.select(1, i).unsqueeze(1);
+      ;
+      auto key_i = key.select(1, i).unsqueeze(1);
+      ;
+      auto value_i = value.select(1, i).unsqueeze(1);
+      ;
+      auto next_outs =
+          zero_copy_kv_cache_masked_multihead_self_attention_kernel_impl(
+              query_i,
+              key_i,
+              value_i,
+              key_cache,
+              value_cache,
+              beam_idx,
+              offset + i,
+              scale_attn,
+              attention_mask_v);
+      tokens_outs[i] = std::get<0>(next_outs);
+    }
+    auto attn_outs = at::cat(tokens_outs, 2);
+    return std::make_tuple(
+        attn_outs, at::Tensor(), key_cache, value_cache, beam_idx);
   } else {
     return first_token_masked_mha(
         query,
